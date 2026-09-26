@@ -32,14 +32,16 @@ jobs:
 
           case "${DISTRO}" in
             debian)
+              mkdir -m 755 -p /etc/apt/keyrings
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                ca-certificates git bash python3 python3-pip
+                ca-certificates curl gnupg git tar gzip findutils bash nodejs procps \
+                python3 python3-pip
               ;;
             almalinux)
               dnf -y upgrade --refresh
               dnf -y install \
-                ca-certificates git tar gzip findutils bash which \
+                ca-certificates curl-minimal gnupg2 git tar gzip findutils bash which nodejs procps-ng \
                 dnf-plugins-core epel-release
               dnf -y config-manager --set-enabled crb || true
               dnf -y makecache
