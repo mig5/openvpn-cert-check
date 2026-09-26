@@ -4,4 +4,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-"${PYTHON_BIN}" -m pytest -vvvv "$@"
+"${PYTHON_BIN}" -m pytest -vvvv \
+    --cov=cert_check \
+    --cov-branch \
+    --cov-report=term-missing \
+    "$@"
