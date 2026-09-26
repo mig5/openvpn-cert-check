@@ -1,0 +1,16 @@
+{
+  "index": "/tmp/opencode/openvpn-cert-check/tests/fixtures/mixed_index.txt",
+  "checked_at": "2026-09-26T00:21:41.734410+00:00",
+  "expected_count": 4,
+  "valid_count": 4,
+  "revoked_count": 3,
+  "expired_count": 1,
+  "unexpected": [],
+  "missing": [],
+  "duplicate_valid_names": {},
+  "unparseable_valid": [],
+  "expiring": [],
+  "expiring_count": 0,
+  "warn_days": null,
+  "metric_value": 0
+}

@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+
+"""
+Audit an OpenSSL/OpenVPN CA index against the certificates we expect
+to be currently valid.
+
+Exit codes:
+    0 - no unexpected valid certificates, no expiring warnings
+    1 - unexpected or unparseable valid certificates found
+    2 - configuration/input error
+    3 - valid certificate(s) expiring within --warn-days (warning only)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import Counter
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_INDEX = Path("/root/openvpn-ca/keys/index.txt")
+
+
+@dataclass(frozen=True)
+class Certificate:
+    line: int
+    status: str
+    expires: datetime | None
+    revoked: datetime | None
+    serial: str
+    filename: str
+    subject: str
+    name: str | None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Audit valid OpenVPN certificates against an expected list."
+    )
+    parser.add_argument(
+        "-i",
+        "--index",
+        type=Path,
+        default=DEFAULT_INDEX,
+        help=f"OpenSSL index file (default: {DEFAULT_INDEX})",
+    )
+    parser.add_argument(
+        "-e",
+        "--expected-file",
+        type=Path,
+        required=True,
+        help="Read expected certificate names from a file, one per line",
+    )
+    parser.add_argument(
+        "-w",
+        "--warn-days",
+        type=int,
+        default=None,
+        help="Warn about valid certificates expiring within this many days",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Produce machine-readable JSON output",
+    )
+
+    return parser.parse_args()
+
+
+def parse_openssl_time(value: str) -> datetime | None:
+    """Parse ASN.1 UTCTime or GeneralizedTime used by OpenSSL."""
+    if not value:
+        return None
+
+    try:
+        if len(value) == 13:  # YYMMDDHHMMSSZ
+            year = int(value[:2])
+            year += 2000 if year < 50 else 1900
+
+            return datetime(
+                year,
+                int(value[2:4]),
+                int(value[4:6]),
+                int(value[6:8]),
+                int(value[8:10]),
+                int(value[10:12]),
+                tzinfo=timezone.utc,
+            )
+
+        if len(value) == 15:  # YYYYMMDDHHMMSSZ
+            return datetime.strptime(value, "%Y%m%d%H%M%SZ").replace(
+                tzinfo=timezone.utc
+            )
+
+    except ValueError:
+        pass
+
+    raise ValueError(f"invalid OpenSSL timestamp: {value!r}")
+
+
+def split_escaped(value: str, separator: str) -> list[str]:
+    """Split a DN component while respecting backslash escaping."""
+    result: list[str] = []
+    current: list[str] = []
+    escaped = False
+
+    for char in value:
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == separator:
+            result.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+
+    if escaped:
+        current.append("\\")
+
+    result.append("".join(current))
+    return result
+
+
+def parse_subject(subject: str) -> dict[str, list[str]]:
+    """
+    Parse the slash-separated OpenSSL DN normally found in index.txt.
+
+    Example:
+        /C=AU/O=Example/CN=miguel
+    """
+    attributes: dict[str, list[str]] = {}
+
+    if subject.startswith("/"):
+        components = split_escaped(subject[1:], "/")
+    else:
+        # Some OpenSSL configurations may emit RFC2253-ish subjects.
+        components = split_escaped(subject, ",")
+
+    for component in components:
+        if "=" not in component:
+            continue
+
+        key, value = component.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if key:
+            attributes.setdefault(key, []).append(value)
+
+    return attributes
+
+
+def certificate_name(subject: str) -> str | None:
+    attrs = parse_subject(subject)
+
+    # CN is the conventional certificate identity. The "name" fallback
+    # accommodates older/custom OpenSSL configurations.
+    for attribute in ("CN", "commonName", "name", "UID"):
+        values = attrs.get(attribute)
+        if values:
+            return values[-1]
+
+    return None
+
+
+def read_index(path: Path) -> list[Certificate]:
+    certificates: list[Certificate] = []
+
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise RuntimeError(f"index file does not exist: {path}")
+    except PermissionError:
+        raise RuntimeError(f"permission denied reading index file: {path}")
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {path}: {exc}")
+
+    for line_number, line in enumerate(contents.splitlines(), 1):
+        if not line.strip():
+            continue
+
+        fields = line.split("\t", 5)
+
+        if len(fields) != 6:
+            raise RuntimeError(
+                f"{path}:{line_number}: expected 6 tab-separated fields, "
+                f"found {len(fields)}"
+            )
+
+        status, expires, revoked, serial, filename, subject = fields
+
+        try:
+            certificates.append(
+                Certificate(
+                    line=line_number,
+                    status=status,
+                    expires=parse_openssl_time(expires),
+                    revoked=parse_openssl_time(revoked),
+                    serial=serial,
+                    filename=filename,
+                    subject=subject,
+                    name=certificate_name(subject),
+                )
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"{path}:{line_number}: {exc}") from exc
+
+    return certificates
+
+
+def load_expected(path: Path | None) -> set[str]:
+    if path is None:
+        raise RuntimeError(
+            "no expected certificate file provided; use --expected-file"
+        )
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise RuntimeError(f"cannot read expected certificate file {path}: {exc}")
+
+    expected = {
+        line.strip()
+        for line in lines
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+    if not expected:
+        raise RuntimeError(f"expected certificate file is empty: {path}")
+
+    return expected
+
+
+def effective_status(cert: Certificate, now: datetime) -> str:
+    """
+    Do not rely solely on OpenSSL having run `ca -updatedb`.
+
+    A database entry may still say V even though its expiry time has passed.
+    """
+    if cert.status == "R":
+        return "revoked"
+
+    if cert.status == "E":
+        return "expired"
+
+    if cert.expires is not None and cert.expires <= now:
+        return "expired"
+
+    if cert.status == "V":
+        return "valid"
+
+    return "unknown"
+
+
+def format_time(value: datetime | None) -> str:
+    if value is None:
+        return "-"
+
+    return value.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def time_verb(expires: datetime | None, now: datetime) -> str:
+    """Return 'expired' for past dates, 'expires' for future dates."""
+    if expires is not None and expires <= now:
+        return "expired"
+    return "expires"
+
+
+def print_certificates(
+    title: str, certificates: list[Certificate], now: datetime
+) -> None:
+    print(f"\n{title}")
+    print("-" * len(title))
+
+    if not certificates:
+        print("  None")
+        return
+
+    width = max(
+        4,
+        *(len(cert.name or "<unparseable>") for cert in certificates),
+    )
+
+    for cert in sorted(certificates, key=lambda item: item.name or item.subject):
+        name = cert.name or "<unparseable>"
+        verb = time_verb(cert.expires, now)
+        print(
+            f"  {name:<{width}}  "
+            f"{verb} {format_time(cert.expires)}  "
+            f"serial {cert.serial}"
+        )
+
+
+def main() -> int:
+    args = parse_args()
+
+    if args.warn_days is not None and args.warn_days < 0:
+        print("ERROR: --warn-days must be non-negative", file=sys.stderr)
+        return 2
+
+    try:
+        expected = load_expected(args.expected_file)
+        certificates = read_index(args.index)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    now = datetime.now(timezone.utc)
+
+    valid = [cert for cert in certificates if effective_status(cert, now) == "valid"]
+    revoked = [
+        cert for cert in certificates if effective_status(cert, now) == "revoked"
+    ]
+    expired = [
+        cert for cert in certificates if effective_status(cert, now) == "expired"
+    ]
+    unknown = [
+        cert for cert in certificates if effective_status(cert, now) == "unknown"
+    ]
+
+    valid_names = {cert.name for cert in valid if cert.name}
+
+    unexpected = sorted(valid_names - expected)
+    missing = sorted(expected - valid_names)
+
+    unparseable_valid = [cert for cert in valid if cert.name is None]
+
+    name_counts = Counter(cert.name for cert in valid if cert.name)
+    duplicates = {name: count for name, count in name_counts.items() if count > 1}
+
+    # A valid certificate whose identity cannot be parsed is treated as
+    # unexpected rather than silently ignored.
+    findings = len(unexpected) + len(unparseable_valid)
+
+    # Certificates expiring within the warning window
+    if args.warn_days is not None:
+        expiring = sorted(
+            [
+                cert
+                for cert in valid
+                if cert.expires is not None
+                and (cert.expires - now).days <= args.warn_days
+            ],
+            key=lambda c: c.expires,
+        )
+    else:
+        expiring = []
+
+    if args.json:
+        output = {
+            "index": str(args.index),
+            "checked_at": now.isoformat(),
+            "expected_count": len(expected),
+            "valid_count": len(valid),
+            "revoked_count": len(revoked),
+            "expired_count": len(expired),
+            "unexpected": unexpected,
+            "missing": missing,
+            "duplicate_valid_names": duplicates,
+            "unparseable_valid": [asdict(cert) for cert in unparseable_valid],
+            "expiring": [
+                {
+                    "name": cert.name,
+                    "expires": cert.expires.isoformat()
+                    if cert.expires
+                    else None,
+                    "days": (cert.expires - now).days
+                    if cert.expires
+                    else None,
+                }
+                for cert in expiring
+            ],
+            "expiring_count": len(expiring),
+            "warn_days": args.warn_days,
+            "metric_value": findings,
+        }
+
+        print(json.dumps(output, default=str, indent=2))
+
+        if findings:
+            return 1
+        if expiring:
+            return 3
+        return 0
+
+    print("OpenVPN certificate audit")
+    print("=========================")
+    print(f"CA database : {args.index}")
+    print(f"Checked     : {format_time(now)}")
+    print(f"Expected    : {len(expected)}")
+    print(f"Valid       : {len(valid)}")
+    print(f"Revoked     : {len(revoked)}")
+    print(f"Expired     : {len(expired)}")
+
+    print("\nValid certificates")
+    print("------------------")
+
+    if not valid:
+        print("  None")
+    else:
+        width = max(
+            4, *(len(cert.name or "<unparseable>") for cert in valid)
+        )
+
+        for cert in sorted(valid, key=lambda item: item.name or item.subject):
+            name = cert.name or "<unparseable>"
+
+            if cert.name is None:
+                result = "UNPARSEABLE"
+            elif cert.name in expected:
+                result = "OK"
+            else:
+                result = "UNEXPECTED"
+
+            print(
+                f"  {name:<{width}}  "
+                f"{result:<12}  "
+                f"expires {format_time(cert.expires)}"
+            )
+
+    if expiring:
+        header = f"Expiring soon (within {args.warn_days} days)"
+        print(f"\n{header}")
+        print("-" * len(header))
+
+        width = max(
+            4, *(len(cert.name or "<unparseable>") for cert in expiring)
+        )
+
+        for cert in expiring:
+            name = cert.name or "<unparseable>"
+            days = (cert.expires - now).days
+            print(
+                f"  {name:<{width}}  "
+                f"expires {format_time(cert.expires)}  "
+                f"in {days} day{'s' if days != 1 else ''}"
+            )
+
+    print_certificates("Revoked certificates", revoked, now)
+    print_certificates("Expired certificates", expired, now)
+
+    if missing:
+        print("\nExpected but not currently valid")
+        print("--------------------------------")
+        for name in missing:
+            print(f"  {name}")
+
+    if duplicates:
+        print("\nMultiple valid certificates with the same name")
+        print("----------------------------------------------")
+        for name, count in sorted(duplicates.items()):
+            print(f"  {name}: {count}")
+
+    if unknown:
+        print("\nUnknown index statuses")
+        print("----------------------")
+        for cert in unknown:
+            print(
+                f"  line {cert.line}: status={cert.status!r} "
+                f"subject={cert.subject}"
+            )
+
+    if findings:
+        print(
+            f"\nFAILED: {findings} unexpected valid certificate"
+            f"{'s' if findings != 1 else ''} found."
+        )
+        return 1
+
+    if expiring:
+        print(
+            f"\nWARNING: {len(expiring)} valid certificate"
+            f"{'s' if len(expiring) != 1 else ''} expiring within "
+            f"{args.warn_days} days."
+        )
+        return 3
+
+    print("\nOK: all valid certificates are expected.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

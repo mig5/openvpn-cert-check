@@ -1,0 +1,8 @@
+V	310827234024Z		01	unknown	/C=AU/O=Example/CN=alice
+V	330225085227Z		02	unknown	/C=AU/O=Example/CN=bob
+V	301215071212Z		03	unknown	/C=AU/O=Example/CN=cora
+V	291214005819Z		04	unknown	/C=AU/O=Example/CN=dan
+R	320509155312Z	260901010101Z	20	unknown	/C=AU/O=Example/CN=edward
+R	320215121926Z	260901010101Z	1C	unknown	/C=AU/O=Example/CN=florence
+R	320409010429Z	260901010101Z	1F	unknown	/C=AU/O=Example/CN=gordon
+E	260507231923Z		0F	unknown	/C=AU/O=Example/CN=harriet

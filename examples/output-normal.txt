@@ -1,0 +1,27 @@
+OpenVPN certificate audit
+=========================
+CA database : /tmp/opencode/openvpn-cert-check/tests/fixtures/mixed_index.txt
+Checked     : 2026-09-26 00:21:41 UTC
+Expected    : 4
+Valid       : 4
+Revoked     : 3
+Expired     : 1
+
+Valid certificates
+------------------
+  alice  OK            expires 2031-08-27 23:40:24 UTC
+  bob    OK            expires 2033-02-25 08:52:27 UTC
+  cora   OK            expires 2030-12-15 07:12:12 UTC
+  dan    OK            expires 2029-12-14 00:58:19 UTC
+
+Revoked certificates
+--------------------
+  edward    expires 2032-05-09 15:53:12 UTC  serial 20
+  florence  expires 2032-02-15 12:19:26 UTC  serial 1C
+  gordon    expires 2032-04-09 01:04:29 UTC  serial 1F
+
+Expired certificates
+--------------------
+  harriet  expired 2026-05-07 23:19:23 UTC  serial 0F
+
+OK: all valid certificates are expected.

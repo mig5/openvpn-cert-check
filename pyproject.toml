@@ -1,0 +1,11 @@
+[project]
+name = "openvpn-cert-check"
+version = "1.0.0"
+description = "Audit an OpenSSL/OpenVPN CA index against expected valid certificates"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
